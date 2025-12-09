@@ -1,0 +1,263 @@
+#include <stdio.h>    // 标准输入输出函数（printf、fopen等）
+#include <stdlib.h>   // 标准库函数（内存分配等）
+#include <string.h>   // 字符串处理函数（memset、strlen等）
+#include <stdint.h>   // 标准整数类型（uint8_t、uint32_t等）
+
+// SM3算法常量定义
+#define SM3_DIGEST_LENGTH 32  // 哈希结果长度（32字节 = 256bit）
+#define SM3_BLOCK_SIZE 64     // 消息块大小（64字节 = 512bit）
+
+// SM3上下文结构体：保存算法计算过程中的中间状态
+typedef struct {
+    uint32_t state[8];        // 压缩函数的8个状态变量（A~H）
+    uint64_t total_length;    // 原始消息的总长度（单位：bit）
+    uint8_t buffer[SM3_BLOCK_SIZE];  // 消息缓冲区，用于暂存未处理的消息
+    int buffer_length;        // 缓冲区中已存储的字节数（0~63）
+} SM3_CTX;
+
+// 循环左移函数：将32位整数x左移n位，溢出部分补到右侧
+// 例：ROTL(0b1001, 2) = 0b0110（假设32位补零）
+#define ROTL(x, n) (((x) << (n)) | ((x) >> (32 - (n))))
+
+// 压缩函数中的常量数组T[64]
+// 前16轮（i=0~15）使用0x79cc4519，后48轮（i=16~63）使用0x7a879d8a
+static const uint32_t T[64] = {
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x79cc4519, 0x79cc4519, 0x79cc4519, 0x79cc4519,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a,
+    0x7a879d8a, 0x7a879d8a, 0x7a879d8a, 0x7a879d8a
+};
+
+// 布尔函数FF：根据轮数i选择不同的逻辑运算
+// i=0~15时：FF0(x,y,z) = x ^ y ^ z（异或）
+// i=16~63时：FF1(x,y,z) = (x&y) | (x&z) | (y&z)（与或混合）
+#define FF0(x, y, z) ((x) ^ (y) ^ (z))
+#define FF1(x, y, z) (((x) & (y)) | (x) & (z) | (y) & (z))
+
+// 布尔函数GG：根据轮数i选择不同的逻辑运算
+// i=0~15时：GG0(x,y,z) = x ^ y ^ z（异或）
+// i=16~63时：GG1(x,y,z) = (x&y) | (~x&z)（与非混合）
+#define GG0(x, y, z) ((x) ^ (y) ^ (z))
+#define GG1(x, y, z) (((x) & (y)) | (~(x) & (z)))
+
+// 置换函数P0：用于压缩函数输出变换
+// P0(x) = x ^ ROTL(x,9) ^ ROTL(x,17)
+#define P0(x) ((x) ^ ROTL(x, 9) ^ ROTL(x, 17))
+
+// 置换函数P1：用于消息扩展
+// P1(x) = x ^ ROTL(x,15) ^ ROTL(x,23)
+#define P1(x) ((x) ^ ROTL(x, 15) ^ ROTL(x, 23))
+
+void sm3_init(SM3_CTX* ctx) {
+    // 初始状态变量（A~H）的标准值
+    ctx->state[0] = 0x7380166F;
+    ctx->state[1] = 0x4914B2B9;
+    ctx->state[2] = 0x172442D7;
+    ctx->state[3] = 0xDA8A0600;
+    ctx->state[4] = 0xA96F30BC;
+    ctx->state[5] = 0x163138AA;
+    ctx->state[6] = 0xE38DEE4D;
+    ctx->state[7] = 0xB0FB0E4E;
+    ctx->total_length = 0;       // 初始总长度为0
+    ctx->buffer_length = 0;      // 初始缓冲区为空
+}
+
+
+static void sm3_compress(SM3_CTX* ctx, const uint8_t block[SM3_BLOCK_SIZE]) {
+    uint32_t W[68], W1[64];  // 消息扩展数组
+    uint32_t A, B, C, D, E, F, G, H;  // 压缩迭代的工作变量
+    uint32_t SS1, SS2, TT1, TT2;      // 中间变量
+    int i;
+
+    // 步骤1：消息扩展（生成W[0..67]）
+    // 前16个字W[0..15]：直接从消息块转换（大端存储）
+    for (i = 0; i < 16; i++) {
+        W[i] = (block[i * 4] << 24) |       // 第i*4字节作为高8位
+            (block[i * 4 + 1] << 16) |     // 第i*4+1字节作为次高8位
+            (block[i * 4 + 2] << 8) |      // 第i*4+2字节作为次低8位
+            block[i * 4 + 3];              // 第i*4+3字节作为低8位
+    }
+    // 后52个字W[16..67]：通过前序字计算
+    for (i = 16; i < 68; i++) {
+        W[i] = P1(W[i - 16] ^ W[i - 9] ^ ROTL(W[i - 3], 15))  // P1置换
+            ^ ROTL(W[i - 13], 7)                       // 左移7位
+            ^ W[i - 6];                                // 异或操作
+    }
+
+    // 生成W1数组（用于计算TT1）
+    for (i = 0; i < 64; i++) {
+        W1[i] = W[i] ^ W[i + 4];  // W1[i] = W[i]异或W[i+4]
+    }
+
+    // 步骤2：初始化工作变量（从上下文状态复制）
+    A = ctx->state[0];
+    B = ctx->state[1];
+    C = ctx->state[2];
+    D = ctx->state[3];
+    E = ctx->state[4];
+    F = ctx->state[5];
+    G = ctx->state[6];
+    H = ctx->state[7];
+
+    // 步骤3：64轮压缩迭代
+    for (i = 0; i < 64; i++) {
+        // 计算SS1：(ROTL(A,12) + E + ROTL(T[i],i)) 左移7位
+        SS1 = ROTL((ROTL(A, 12) + E + ROTL(T[i], i)), 7);
+        // SS2 = SS1异或ROTL(A,12)
+        SS2 = SS1 ^ ROTL(A, 12);
+
+        // 计算TT1和TT2：根据轮数选择FF/GG函数
+        if (i < 16) {
+            TT1 = FF0(A, B, C) + D + SS2 + W1[i];
+            TT2 = GG0(E, F, G) + H + SS1 + W[i];
+        }
+        else {
+            TT1 = FF1(A, B, C) + D + SS2 + W1[i];
+            TT2 = GG1(E, F, G) + H + SS1 + W[i];
+        }
+
+        // 更新工作变量（A~H循环移位更新）
+        D = C;
+        C = ROTL(B, 9);
+        B = A;
+        A = TT1;
+        H = G;
+        G = ROTL(F, 19);
+        F = E;
+        E = P0(TT2);  // E用P0置换后的TT2更新
+    }
+
+    // 步骤4：将工作变量与上下文状态异或，更新状态
+    ctx->state[0] ^= A;
+    ctx->state[1] ^= B;
+    ctx->state[2] ^= C;
+    ctx->state[3] ^= D;
+    ctx->state[4] ^= E;
+    ctx->state[5] ^= F;
+    ctx->state[6] ^= G;
+    ctx->state[7] ^= H;
+}
+
+void sm3_update(SM3_CTX* ctx, const uint8_t* data, size_t length) {
+    for (size_t i = 0; i < length; i++) {
+        // 将数据存入缓冲区
+        ctx->buffer[ctx->buffer_length++] = data[i];
+        // 若缓冲区已满（64字节），则处理该块
+        if (ctx->buffer_length == SM3_BLOCK_SIZE) {
+            sm3_compress(ctx, ctx->buffer);  // 压缩当前块
+            ctx->total_length += 8 * SM3_BLOCK_SIZE;  // 更新总长度（bit）
+            ctx->buffer_length = 0;  // 清空缓冲区
+        }
+    }
+}
+
+void sm3_final(SM3_CTX* ctx, uint8_t digest[SM3_DIGEST_LENGTH], size_t* padded_length) {
+    // 计算原始消息总长度（bit）：已处理长度 + 缓冲区中未处理的长度
+    uint64_t total_bits = ctx->total_length + (uint64_t)ctx->buffer_length * 8;
+    int orig_buffer_len = ctx->buffer_length;  // 记录缓冲区中原始数据的长度
+
+    // 步骤1：添加填充标记0x80（表示填充开始）
+    ctx->buffer[ctx->buffer_length++] = 0x80;
+
+    // 步骤2：判断是否需要额外块
+    int need_extra_block = 0;
+    // 若添加0x80后，缓冲区剩余空间不足8字节（无法存储长度信息）
+    if (ctx->buffer_length > SM3_BLOCK_SIZE - 8) {
+        // 填充0x00至满块，处理该块
+        memset(ctx->buffer + ctx->buffer_length, 0, SM3_BLOCK_SIZE - ctx->buffer_length);
+        sm3_compress(ctx, ctx->buffer);
+        ctx->buffer_length = 0;  // 清空缓冲区，准备新块
+        need_extra_block = 1;    // 标记使用了额外块
+    }
+
+    // 填充0x00，直到距离块末尾只剩8字节（用于存储长度）
+    memset(ctx->buffer + ctx->buffer_length, 0, SM3_BLOCK_SIZE - 8 - ctx->buffer_length);
+
+    // 步骤3：添加原始消息总长度（64bit，大端存储）
+    ctx->buffer[SM3_BLOCK_SIZE - 8] = (uint8_t)(total_bits >> 56);  // 最高8位
+    ctx->buffer[SM3_BLOCK_SIZE - 7] = (uint8_t)(total_bits >> 48);
+    ctx->buffer[SM3_BLOCK_SIZE - 6] = (uint8_t)(total_bits >> 40);
+    ctx->buffer[SM3_BLOCK_SIZE - 5] = (uint8_t)(total_bits >> 32);
+    ctx->buffer[SM3_BLOCK_SIZE - 4] = (uint8_t)(total_bits >> 24);
+    ctx->buffer[SM3_BLOCK_SIZE - 3] = (uint8_t)(total_bits >> 16);
+    ctx->buffer[SM3_BLOCK_SIZE - 2] = (uint8_t)(total_bits >> 8);
+    ctx->buffer[SM3_BLOCK_SIZE - 1] = (uint8_t)(total_bits);         // 最低8位
+
+    // 处理最后一个块（包含填充和长度信息）
+    sm3_compress(ctx, ctx->buffer);
+
+    // 计算填充后的总长度（字节）
+    if (padded_length != NULL) {
+        // 基础长度 = 原始数据 + 0x80标记 + 填充0的字节 + 8字节长度
+        *padded_length = orig_buffer_len + 1 + (SM3_BLOCK_SIZE - 8 - orig_buffer_len - 1) + 8;
+        // 若使用了额外块，总长度需加一个块大小（64字节）
+        if (need_extra_block) {
+            *padded_length += SM3_BLOCK_SIZE;
+        }
+    }
+
+    // 将最终状态转换为哈希值（大端转字节数组）
+    for (int i = 0; i < 8; i++) {
+        digest[i * 4] = (uint8_t)(ctx->state[i] >> 24);  // 高8位
+        digest[i * 4 + 1] = (uint8_t)(ctx->state[i] >> 16);
+        digest[i * 4 + 2] = (uint8_t)(ctx->state[i] >> 8);
+        digest[i * 4 + 3] = (uint8_t)(ctx->state[i]);       // 低8位
+    }
+}
+
+void sm3_calc(const uint8_t* data, size_t length, uint8_t digest[SM3_DIGEST_LENGTH], size_t* padded_length) {
+    SM3_CTX ctx;
+    sm3_init(&ctx);         // 初始化上下文
+    sm3_update(&ctx, data, length);  // 处理数据
+    sm3_final(&ctx, digest, padded_length);  // 完成计算
+}
+
+void test_string(const char* str) {
+    uint8_t digest[SM3_DIGEST_LENGTH];  // 存储哈希结果
+    size_t padded_len;                  // 存储填充后长度
+    size_t orig_len = strlen(str);      // 原始字符串长度（字节）
+
+    // 计算哈希值和填充后长度
+    sm3_calc((const uint8_t*)str, orig_len, digest, &padded_len);
+
+    // 打印结果
+    printf("\n输入字符串: \"%s\"", str);
+    printf("\n原始长度: %zu字节 (%zu bit)", orig_len, orig_len * 8);
+    printf("\n填充后长度: %zu字节 (%zu bit)", padded_len, padded_len * 8);
+    printf("\nSM3哈希值: ");
+    for (int i = 0; i < SM3_DIGEST_LENGTH; i++) {
+        printf("%02x", digest[i]);  // 以十六进制打印哈希值
+    }
+    printf("\n");
+}
+
+int main() {
+    // 测试边界用例
+    /*test_string("");          // 空字符串（0字节）
+    test_string("a");         // 1字节（8bit）
+    // 56字节（448bit，刚好需要填充1字节0x80+7字节0+8字节长度，共64字节）
+    test_string("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    // 1024字节（16个块，无需额外填充块）
+    test_string("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    */
+    // 自定义输入测试
+    char input[1024];
+    printf("\n请输入要计算的字符串: ");
+    fgets(input, sizeof(input), stdin);  // 读取用户输入
+    input[strcspn(input, "\n")] = '\0';  // 去除换行符
+    test_string(input);
+
+    return 0;
+}
