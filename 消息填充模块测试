@@ -1,0 +1,79 @@
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+
+// SM3填充函数：对输入消息进行填充，返回填充后的总长度（字节）
+// input: 原始消息
+// input_len: 原始消息长度（字节）
+// output: 填充后的消息缓冲区（需提前分配足够空间，至少input_len + 64字节）
+uint64_t sm3_padding(const uint8_t *input, uint64_t input_len, uint8_t *output) {
+    uint64_t total_bits = input_len * 8;  // 原始消息总比特数
+    uint64_t pad_zero_bits;               // 需要填充的0比特数
+    
+    // 步骤1：复制原始消息到输出缓冲区
+    memcpy(output, input, input_len);
+    
+    // 步骤2：填充1个比特1（对应字节的最高位）
+    output[input_len] = 0x80;  // 二进制: 10000000
+    
+    // 步骤3：计算需要填充的0比特数，满足 (total_bits + 1 + pad_zero_bits) ≡ 448 mod 512
+    pad_zero_bits = (448 - (total_bits + 1) % 512) % 512;
+    uint64_t pad_zero_bytes = pad_zero_bits / 8;  // 转换为字节数
+    
+    // 步骤4：填充0字节
+    memset(output + input_len + 1, 0, pad_zero_bytes);
+    
+    // 步骤5：填充原始消息的比特长度（64位，小端/大端需符合SM3标准，此处为大端）
+    uint8_t *len_ptr = output + input_len + 1 + pad_zero_bytes;
+    for (int i = 0; i < 8; i++) {
+        len_ptr[7 - i] = (total_bits >> (i * 8)) & 0xFF;  // 大端存储
+    }
+    
+    // 返回填充后的总字节数（512比特的整数倍）
+    return input_len + 1 + pad_zero_bytes + 8;
+}
+
+// 验证函数：打印填充前后的关键信息
+void verify_sm3_padding(const uint8_t *msg, uint64_t msg_len) {
+    // 分配足够大的缓冲区（最多填充64字节）
+    uint8_t padded_msg[1024] = {0};
+    uint64_t padded_len = sm3_padding(msg, msg_len, padded_msg);
+    
+    // 打印验证信息
+    printf("=== SM3填充长度验证 ===\n");
+    printf("原始消息长度（字节）: %llu\n", msg_len);
+    printf("原始消息长度（比特）: %llu\n", msg_len * 8);
+    printf("填充后总长度（字节）: %llu\n", padded_len);
+    printf("填充后总长度（比特）: %llu\n", padded_len * 8);
+    printf("填充后总长度是否为512比特整数倍: %s\n", 
+           (padded_len * 8) % 512 == 0 ? "是" : "否");
+    printf("填充的0字节数: %llu\n", padded_len - msg_len - 1 - 8);
+    
+    // 验证核心规则：填充后前448比特的最后是长度字段的前导
+    uint64_t total_bits = padded_len * 8;
+    printf("核心规则验证（(原始比特数+1+0比特数) ≡ 448 mod 512）: %s\n",
+           ((msg_len*8 + 1 + (padded_len - msg_len - 1 - 8)*8) % 512) == 448 ? "通过" : "失败");
+    printf("========================\n\n");
+}
+
+int main() {
+    // 测试用例1：空消息
+    uint8_t msg1[] = "";
+    verify_sm3_padding(msg1, 0);
+    
+    // 测试用例2：长度为1字节的消息
+    uint8_t msg2[] = "a";
+    verify_sm3_padding(msg2, 1);
+    
+    // 测试用例3：长度刚好448比特（56字节）的消息
+    uint8_t msg3[56] = {0};
+    memset(msg3, 'b', 56);
+    verify_sm3_padding(msg3, 56);
+    
+    // 测试用例4：长度刚好512比特（64字节）的消息
+    uint8_t msg4[64] = {0};
+    memset(msg4, 'c', 64);
+    verify_sm3_padding(msg4, 64);
+    
+    return 0;
+}
