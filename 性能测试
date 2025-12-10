@@ -1,0 +1,57 @@
+// 性能测试
+void performance_test() {
+    printf("================================================================================\n");
+    printf("性能测试\n");
+    printf("================================================================================\n");
+
+    printf("测试环境:\n");
+    printf("  操作系统: Windows\n");
+    printf("  编译器: MSVC/GCC\n");
+    printf("  测试方法: Windows API\n\n");
+
+    size_t test_sizes[] = { 16, 1024, 10240, 102400, 1048576 };
+    int num_sizes = sizeof(test_sizes) / sizeof(test_sizes[0]);
+
+    printf("性能测试结果:\n");
+    printf("%-12s %-15s %-15s\n", "输入长度", "平均耗时(ms)", "吞吐量(MB/s)");
+    printf("-------------------------------------------------\n");
+
+    for (int i = 0; i < num_sizes; i++) {
+        size_t size = test_sizes[i];
+        uint8_t* test_data = (uint8_t*)malloc(size);
+        generate_random_data(test_data, size);
+
+        long long total_time = 0;
+        int num_tests = 5; // 减少测试次数
+        long long* times = (long long*)malloc(num_tests * sizeof(long long));
+
+        // 执行多次测试
+        for (int j = 0; j < num_tests; j++) {
+            uint8_t digest[32];
+            long long start_time = get_current_time_ms();
+            sm3(test_data, size, digest);
+            long long end_time = get_current_time_ms();
+            times[j] = end_time - start_time;
+            total_time += times[j];
+        }
+
+        // 去除最大值和最小值
+        long long min_time = times[0], max_time = times[0];
+        for (int j = 1; j < num_tests; j++) {
+            if (times[j] < min_time) min_time = times[j];
+            if (times[j] > max_time) max_time = times[j];
+        }
+
+        double avg_time = (double)(total_time - min_time - max_time) / (num_tests - 2);
+        double throughput = 0;
+        if (avg_time > 0) {
+            throughput = (size / 1024.0 / 1024.0) / (avg_time / 1000.0);
+        }
+
+        printf("%-12zu %-15.3f %-15.2f\n", size, avg_time, throughput);
+
+        free(test_data);
+        free(times);
+    }
+    printf("\n");
+}
